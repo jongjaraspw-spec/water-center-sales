@@ -660,10 +660,11 @@
       <label class="form-label">🧾 แนบสลิป (ถ้ามี)</label>
       <div class="upload-area" id="uploadArea">
         <input type="file" accept="image/*" id="slipInput" onchange="handleSlip(event)">
-        <div class="upload-icon">📎</div>
-        <div class="upload-text">แตะเพื่ออัปโหลดรูปสลิป</div>
+        <div class="upload-icon" id="uploadIcon">📎</div>
+        <div class="upload-text" id="uploadText">แตะเพื่ออัปโหลดรูปสลิป</div>
         <img class="upload-preview" id="slipPreview" style="display:none">
       </div>
+      <div id="slipStatus" style="display:none;margin-top:8px;font-size:12px;padding:8px 12px;border-radius:8px"></div>
     </div>
 
     <button class="btn-primary" onclick="saveRecord()">✅ บันทึกรายการ</button>
@@ -986,19 +987,85 @@ function compressImage(dataUrl, maxWidth, quality) {
   });
 }
 
+// เก็บ base64 ของรูปที่เลือกไว้ชั่วคราว
+let pendingSlipBase64 = '';
+let uploadedSlipUrl = '';
+
 function handleSlip(e) {
   const file = e.target.files[0];
   if (!file) return;
+
+  const statusEl = document.getElementById('slipStatus');
+  const uploadText = document.getElementById('uploadText');
+  const uploadIcon = document.getElementById('uploadIcon');
+
+  uploadIcon.textContent = '⏳';
+  uploadText.textContent = 'กำลังเตรียมรูป...';
+
   const reader = new FileReader();
   reader.onload = async ev => {
-    // ย่อรูปอัตโนมัติ max 800px, quality 0.6
-    const compressed = await compressImage(ev.target.result, 800, 0.6);
+    // บีบอัดรูปก่อน
+    const compressed = await compressImage(ev.target.result, 800, 0.65);
+    pendingSlipBase64 = compressed;
+    uploadedSlipUrl = ''; // รีเซ็ตลิงก์เก่า
+
+    // แสดง preview
     const img = document.getElementById('slipPreview');
     img.src = compressed;
     img.style.display = 'block';
-    document.getElementById('uploadArea').querySelector('.upload-text').textContent = '✅ อัปโหลดสำเร็จ (รูปถูกบีบอัดแล้ว)';
+    uploadIcon.textContent = '✅';
+    uploadText.textContent = 'เลือกรูปแล้ว — จะอัปโหลดขึ้น Drive เมื่อกดบันทึก';
+
+    // ถ้ามี webhook → อัปโหลดขึ้น Drive ทันทีเลย (แบบ background)
+    const url = getWebhook();
+    if (url) {
+      statusEl.style.display = 'block';
+      statusEl.style.background = 'rgba(14,165,233,0.08)';
+      statusEl.style.color = 'var(--blue-dark)';
+      statusEl.textContent = '☁️ กำลังอัปโหลดสลิปขึ้น Google Drive...';
+      uploadSlipToDrive(compressed, url).then(driveUrl => {
+        if (driveUrl) {
+          uploadedSlipUrl = driveUrl;
+          statusEl.style.background = 'rgba(16,185,129,0.1)';
+          statusEl.style.color = '#065F46';
+          statusEl.textContent = '✅ อัปโหลดสลิปขึ้น Google Drive สำเร็จ!';
+          uploadText.textContent = '✅ อัปโหลดสำเร็จ — พร้อมบันทึก';
+        } else {
+          statusEl.style.background = 'rgba(245,158,11,0.1)';
+          statusEl.style.color = '#92400E';
+          statusEl.textContent = '⚠️ อัปโหลด Drive ไม่สำเร็จ — จะเก็บรูปไว้ในแอปแทน';
+        }
+      });
+    } else {
+      statusEl.style.display = 'block';
+      statusEl.style.background = 'rgba(245,158,11,0.08)';
+      statusEl.style.color = '#92400E';
+      statusEl.textContent = '⚠️ ยังไม่ได้ตั้งค่า Webhook URL — รูปจะเก็บในแอปชั่วคราว';
+    }
   };
   reader.readAsDataURL(file);
+}
+
+async function uploadSlipToDrive(base64Data, webhookUrl) {
+  try {
+    const response = await fetch(webhookUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: 'uploadSlip',
+        imageData: base64Data,
+        recordId: Date.now().toString()
+      })
+    });
+    const result = await response.json();
+    if (result.status === 'ok' && result.url) {
+      return result.url;
+    }
+    return null;
+  } catch(e) {
+    console.warn('Drive upload failed:', e);
+    return null;
+  }
 }
 
 // ═══════════════════════════════
@@ -1023,8 +1090,6 @@ function saveRecord() {
   if (items.length === 0) { showToast('⚠️ กรุณาเพิ่มสินค้าอย่างน้อย 1 รายการ'); return; }
 
   const payment = document.getElementById('paymentType').value;
-  const slipPreview = document.getElementById('slipPreview');
-  const slipSrc = slipPreview.src || '';
 
   const record = {
     id: Date.now().toString(),
@@ -1032,18 +1097,20 @@ function saveRecord() {
     items,
     total,
     payment,
-    slip: slipSrc.startsWith('data:') ? slipSrc : '',
+    // เก็บลิงก์ Drive (ถ้าอัปโหลดสำเร็จ) หรือ base64 ชั่วคราว (ถ้าไม่มี webhook)
+    slipUrl: uploadedSlipUrl || '',
+    slip: uploadedSlipUrl ? '' : pendingSlipBase64, // เก็บ base64 เฉพาะกรณีไม่มี Drive
     createdAt: new Date().toISOString()
   };
 
-  // บันทึกลง localStorage ก่อนเสมอ (ไม่ค้าง)
+  // บันทึกลง localStorage
   try {
     const data = getData();
     data.push(record);
     saveData(data);
     updateSyncCount();
   } catch(e) {
-    // localStorage เต็ม (อาจเกิดจากรูปสลิปใหญ่เกิน) → บันทึกโดยไม่มีรูป
+    // localStorage เต็ม → บันทึกโดยไม่มีรูป
     showToast('⚠️ พื้นที่เต็ม บันทึกโดยไม่มีรูปสลิป');
     record.slip = '';
     const data = getData();
@@ -1052,18 +1119,22 @@ function saveRecord() {
     updateSyncCount();
   }
 
-  // ส่ง Google Sheets แบบ background (ไม่รอ ไม่ค้าง)
+  // ส่ง Google Sheets แบบ background
   sendToSheets(record);
 
   // Reset form
   document.getElementById('itemList').innerHTML = '';
   addItem();
   document.getElementById('recordDate').value = today();
-  slipPreview.style.display = 'none';
-  slipPreview.src = '';
+  document.getElementById('slipPreview').style.display = 'none';
+  document.getElementById('slipPreview').src = '';
   document.getElementById('slipInput').value = '';
-  document.getElementById('uploadArea').querySelector('.upload-text').textContent = 'แตะเพื่ออัปโหลดรูปสลิป';
+  document.getElementById('uploadIcon').textContent = '📎';
+  document.getElementById('uploadText').textContent = 'แตะเพื่ออัปโหลดรูปสลิป';
+  document.getElementById('slipStatus').style.display = 'none';
   document.getElementById('recordTotal').textContent = '0 ฿';
+  pendingSlipBase64 = '';
+  uploadedSlipUrl = '';
 
   showToast('✅ บันทึกเรียบร้อยแล้ว!', 'success');
   refreshToday();
@@ -1199,7 +1270,16 @@ function showTxDetail(id) {
       <span style="font-weight:700">รวม</span>
       <span style="font-family:'Kanit',sans-serif;font-size:20px;font-weight:700;color:var(--blue-1)">${fmt(r.total)} ฿</span>
     </div>
-    ${r.slip ? `<img src="${r.slip}" style="width:100%;border-radius:10px;margin-top:12px">` : ''}
+    ${(r.slipUrl || r.slip) ? `
+      <div style="margin-top:12px">
+        <div style="font-size:12px;color:var(--text3);margin-bottom:6px">🧾 สลิปการโอน</div>
+        ${r.slipUrl
+          ? `<a href="${r.slipUrl}" target="_blank" style="display:block">
+               <img src="${r.slipUrl}" style="width:100%;border-radius:10px;border:1px solid rgba(14,165,233,0.2)" onerror="this.parentElement.innerHTML='<div style=\'text-align:center;padding:16px;background:#f1f5f9;border-radius:10px\'><div style=\'font-size:24px\'>🔗</div><a href=\'${r.slipUrl}\' target=\'_blank\' style=\'color:var(--blue-1);font-size:13px\'>กดเพื่อดูสลิปใน Google Drive</a></div>'">
+             </a>`
+          : `<img src="${r.slip}" style="width:100%;border-radius:10px">`
+        }
+      </div>` : ''}
   `;
   document.getElementById('txModalContent').innerHTML = content;
   document.getElementById('txModal').classList.add('open');
